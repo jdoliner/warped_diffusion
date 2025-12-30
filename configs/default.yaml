@@ -1,0 +1,82 @@
+# Default configuration for Warped Diffusion
+
+# Model settings
+model:
+  pretrained_name: "runwayml/stable-diffusion-v1-5"
+  clip_model_name: "openai/clip-vit-large-patch14"
+
+# Warp layer settings
+warp:
+  grid_size: 8
+  max_displacement: 0.3
+  epsilon_floor: 0.1
+  
+  # Energy function weights
+  energy_alpha: 0.5   # CLIP saliency
+  energy_beta: 0.4    # Cross-attention
+  energy_gamma: 0.1   # Sobel edges
+  
+  # Warp schedule (timestep thresholds out of 1000)
+  t_structural: 700
+  t_refinement: 300
+  num_timesteps: 1000
+
+# LoRA training settings
+lora_training:
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.1
+  lora_target_modules:
+    - "to_q"
+    - "to_k"
+    - "to_v"
+    - "to_out.0"
+  
+  num_train_steps: 10000
+  batch_size: 4
+  learning_rate: 1.0e-4
+  lr_scheduler: "cosine"
+  lr_warmup_steps: 500
+  gradient_accumulation_steps: 1
+  mixed_precision: "fp16"
+  
+  # Regularization
+  tv_loss_weight: 0.01
+
+# Latent-CLIP training settings
+latent_clip_training:
+  num_train_steps: 5000
+  batch_size: 32
+  learning_rate: 1.0e-4
+  
+  # Projector architecture
+  hidden_dim: 1024
+  num_layers: 3
+  pool_size: 8
+
+# Dataset settings
+data:
+  dataset_name: "detection-datasets/coco"
+  dataset_config: "2017"
+  image_column: "image"
+  caption_column: "sentences"
+  resolution: 512
+  num_workers: 8
+
+# Logging settings
+logging:
+  output_dir: "outputs"
+  logging_steps: 50
+  save_steps: 1000
+  sample_steps: 500
+
+# Hardware settings
+hardware:
+  device: "cuda"
+  seed: 42
+
+# Inference settings
+inference:
+  num_inference_steps: 50
+  guidance_scale: 7.5
+  enable_warp: true
