@@ -188,12 +188,25 @@ class LatentCLIPTrainer:
         print(f"Dataset loaded: {len(self.dataset)} samples")
 
     def _setup_optimizer(self):
-        """Setup optimizer."""
+        """Setup optimizer with cosine LR schedule."""
         self.optimizer = torch.optim.AdamW(
             self.projector.parameters(),
             lr=self.config.learning_rate,
             weight_decay=0.01,
+            betas=(0.9, 0.98),  # Higher beta2 for stability
+            eps=1e-6,
         )
+
+        # Cosine annealing with warmup
+        warmup_steps = min(500, self.config.num_train_steps // 10)
+
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return step / warmup_steps
+            progress = (step - warmup_steps) / (self.config.num_train_steps - warmup_steps)
+            return 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)).item())
+
+        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
     def _setup_logging(self):
         """Setup tensorboard logging."""
@@ -237,11 +250,17 @@ class LatentCLIPTrainer:
         # Backward
         self.optimizer.zero_grad()
         loss.backward()
+
+        # Gradient clipping for stability
+        torch.nn.utils.clip_grad_norm_(self.projector.parameters(), max_norm=1.0)
+
         self.optimizer.step()
+        self.lr_scheduler.step()
 
         return {
             "loss": loss.item(),
             "cosine_similarity": cosine_sim.item(),
+            "lr": self.optimizer.param_groups[0]["lr"],
         }
 
     def save_checkpoint(self, step: int):
@@ -273,20 +292,25 @@ class LatentCLIPTrainer:
             if (step + 1) % self.config.logging_steps == 0:
                 avg_loss = running_loss / self.config.logging_steps
                 avg_sim = running_sim / self.config.logging_steps
+                current_lr = metrics.get("lr", self.config.learning_rate)
                 running_loss = 0.0
                 running_sim = 0.0
 
                 self.writer.add_scalar("train/loss", avg_loss, step)
                 self.writer.add_scalar("train/cosine_similarity", avg_sim, step)
+                self.writer.add_scalar("train/lr", current_lr, step)
 
                 progress_bar.set_postfix(
                     {
                         "loss": f"{avg_loss:.4f}",
                         "cos_sim": f"{avg_sim:.4f}",
+                        "lr": f"{current_lr:.2e}",
                     }
                 )
 
-                print(f"Step {step + 1}: loss={avg_loss:.4f}, cos_sim={avg_sim:.4f}")
+                print(
+                    f"Step {step + 1}: loss={avg_loss:.4f}, cos_sim={avg_sim:.4f}, lr={current_lr:.2e}"
+                )
 
             if (step + 1) % self.config.save_steps == 0:
                 self.save_checkpoint(step + 1)
