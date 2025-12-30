@@ -230,11 +230,9 @@ class LatentCLIPTrainer:
         projected = self.projector(latents)
         projected = F.normalize(projected, dim=-1)
 
-        # MSE loss on normalized embeddings
-        loss = F.mse_loss(projected, clip_embedding)
-
-        # Cosine similarity for logging
+        # Cosine similarity loss (1 - cos_sim) - works better for embeddings
         cosine_sim = (projected * clip_embedding).sum(dim=-1).mean()
+        loss = 1.0 - cosine_sim
 
         # Backward
         self.optimizer.zero_grad()
