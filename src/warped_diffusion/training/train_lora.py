@@ -1,7 +1,7 @@
 """LoRA training for warped diffusion.
 
 Trains the U-Net with LoRA adapters to handle warped latent distributions.
-Uses random smooth warps for augmentation to teach equivariance.
+Uses energy-based semantic warps matching inference distribution.
 """
 
 import os
@@ -17,14 +17,17 @@ from tqdm import tqdm
 
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
-from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPModel
 from peft import LoraConfig, get_peft_model
 from datasets import load_dataset
 from PIL import Image
 import torchvision.transforms as transforms
 
 from ..warp.tps import ThinPlateSplineWarp
-from ..warp.grid import ControlGrid, generate_random_warp
+from ..warp.grid import ControlGrid
+from ..warp.energy import EnergyMapComputer
+from ..models.latent_clip import LatentCLIPProjector
+from ..models.semantic_warp_layer import SemanticWarpLayer, WarpSchedule
 
 
 @dataclass
@@ -53,6 +56,16 @@ class TrainingConfig:
     grid_size: int = 8
     max_displacement: float = 0.3
     tv_loss_weight: float = 0.01
+    latent_clip_path: Optional[str] = None  # Path to trained Latent-CLIP projector
+
+    # Warp schedule (for sampling timestep-appropriate warps during training)
+    t_structural: int = 700
+    t_refinement: int = 300
+
+    # Energy weights
+    energy_alpha: float = 0.5  # CLIP saliency weight
+    energy_beta: float = 0.4  # Attention weight (not used in training)
+    energy_gamma: float = 0.1  # Sobel edge weight
 
     # Data
     dataset_name: str = "detection-datasets/coco"
@@ -237,12 +250,58 @@ class WarpedLoRATrainer:
         print("Models loaded.")
 
     def _setup_warp(self):
-        """Setup warping components."""
-        self.tps = ThinPlateSplineWarp(grid_size=self.config.grid_size)
-        self.control_grid = ControlGrid(
+        """Setup warping components with energy-based warping."""
+        print("Setting up warp components...")
+
+        # Load Latent-CLIP projector if provided
+        latent_clip_projector = None
+        if self.config.latent_clip_path is not None:
+            print(f"Loading Latent-CLIP from {self.config.latent_clip_path}")
+            latent_clip_projector = LatentCLIPProjector().to(self.device)
+            latent_clip_projector.load_state_dict(
+                torch.load(self.config.latent_clip_path, map_location=self.device)
+            )
+            latent_clip_projector.eval()
+            latent_clip_projector.requires_grad_(False)
+        else:
+            print("Warning: No Latent-CLIP path provided, using Sobel-only energy")
+
+        # Setup semantic warp layer
+        self.warp_layer = SemanticWarpLayer(
             grid_size=self.config.grid_size,
             max_displacement=self.config.max_displacement,
+            epsilon_floor=0.1,
+            energy_alpha=self.config.energy_alpha if latent_clip_projector else 0.0,
+            energy_beta=0.0,  # No attention during training (chicken-egg problem)
+            energy_gamma=self.config.energy_gamma
+            if latent_clip_projector
+            else 1.0,  # Sobel only if no CLIP
+            t_structural=self.config.t_structural,
+            t_refinement=self.config.t_refinement,
+            num_timesteps=self.noise_scheduler.config.num_train_timesteps,
+            latent_clip_projector=latent_clip_projector,
+        ).to(self.device)
+
+        # Also keep references for TV loss computation
+        self.tps = self.warp_layer.tps
+        self.control_grid = self.warp_layer.control_grid
+
+        # Warp schedule for sampling appropriate warp intensities
+        self.warp_schedule = WarpSchedule(
+            num_timesteps=self.noise_scheduler.config.num_train_timesteps,
+            t_structural=self.config.t_structural,
+            t_refinement=self.config.t_refinement,
         )
+
+        # Load CLIP text encoder for getting text embeddings for saliency
+        if latent_clip_projector is not None:
+            self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(
+                self.device
+            )
+            self.clip_model.eval()
+            self.clip_model.requires_grad_(False)
+        else:
+            self.clip_model = None
 
     def _setup_lora(self):
         """Setup LoRA adapters on U-Net."""
@@ -334,30 +393,66 @@ class WarpedLoRATrainer:
         encoder_hidden_states = self.text_encoder(input_ids)[0]
         return encoder_hidden_states
 
-    def apply_random_warp(
-        self, latents: torch.Tensor
+    @torch.no_grad()
+    def get_clip_text_embedding(self, input_ids: torch.Tensor) -> Optional[torch.Tensor]:
+        """Get CLIP text embedding for saliency computation."""
+        if self.clip_model is None:
+            return None
+
+        # CLIP expects different tokenization, but we can use the text encoder output
+        # and project it. For simplicity, we'll use the mean of the hidden states.
+        text_outputs = self.clip_model.get_text_features(input_ids=input_ids)
+        return text_outputs
+
+    def apply_energy_warp(
+        self,
+        latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        text_embedding: Optional[torch.Tensor] = None,
+        noise_pred: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Apply random smooth warp to latents.
+        """Apply energy-based semantic warp to latents.
 
         Args:
             latents: Input latents [B, C, H, W]
+            timesteps: Current timesteps [B]
+            text_embedding: CLIP text embedding for saliency [B, D]
+            noise_pred: Previous noise prediction for z0 estimation [B, C, H, W]
 
         Returns:
             Tuple of (warped_latents, src_points, dst_points)
         """
         batch_size = latents.shape[0]
 
-        # Generate random warp
-        src_points, dst_points = generate_random_warp(
-            batch_size=batch_size,
-            grid_size=self.config.grid_size,
-            max_displacement=self.config.max_displacement,
-            device=latents.device,
-            dtype=latents.dtype,
+        # Get alpha_cumprod for z0 estimation
+        alpha_cumprod_t = self.noise_scheduler.alphas_cumprod[timesteps]
+
+        # Use the first timestep's warp intensity (they may differ in batch)
+        # For simplicity, use mean timestep
+        mean_timestep = int(timesteps.float().mean().item())
+
+        # Apply forward warp using energy-based warping
+        warped_latents = self.warp_layer.forward_warp(
+            latent=latents,
+            timestep=mean_timestep,
+            attention_maps=None,  # No attention during training
+            text_embedding=text_embedding,
+            noise_pred=noise_pred,
+            alpha_cumprod_t=alpha_cumprod_t.mean()
+            if alpha_cumprod_t.dim() > 0
+            else alpha_cumprod_t,
         )
 
-        # Apply warp
-        warped_latents = self.tps.warp(latents, src_points, dst_points)
+        # Get cached control points from warp layer
+        src_points = self.warp_layer._cached_src_points
+        dst_points = self.warp_layer._cached_dst_points
+
+        # Handle case where no warp was applied (lambda=0)
+        if src_points is None or dst_points is None:
+            src_points = self.control_grid.create_uniform_points(
+                batch_size, latents.device, latents.dtype
+            )
+            dst_points = src_points.clone()
 
         return warped_latents, src_points, dst_points
 
@@ -399,6 +494,9 @@ class WarpedLoRATrainer:
         latents = self.encode_images(pixel_values)
         encoder_hidden_states = self.encode_text(input_ids)
 
+        # Get CLIP text embedding for saliency (if available)
+        text_embedding = self.get_clip_text_embedding(input_ids) if self.clip_model else None
+
         # Sample noise and timesteps
         noise = torch.randn_like(latents)
         batch_size = latents.shape[0]
@@ -409,8 +507,14 @@ class WarpedLoRATrainer:
         # Add noise to latents
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
 
-        # Apply random warp to noisy latents
-        warped_latents, src_points, dst_points = self.apply_random_warp(noisy_latents)
+        # Apply energy-based warp to noisy latents
+        # Note: On first step we don't have noise_pred, so saliency uses just Sobel
+        warped_latents, src_points, dst_points = self.apply_energy_warp(
+            noisy_latents,
+            timesteps,
+            text_embedding=text_embedding,
+            noise_pred=None,  # Could cache from previous step, but adds complexity
+        )
 
         # Forward pass with mixed precision
         with torch.cuda.amp.autocast(enabled=self.config.mixed_precision == "fp16"):
@@ -454,11 +558,16 @@ class WarpedLoRATrainer:
                 self.optimizer.zero_grad()
                 self.lr_scheduler.step()
 
+        # Compute warp intensity for logging
+        mean_timestep = int(timesteps.float().mean().item())
+        warp_intensity = self.warp_schedule(mean_timestep)
+
         return {
             "loss": loss.item(),
             "mse_loss": mse_loss.item(),
             "tv_loss": tv_loss.item(),
             "lr": self.lr_scheduler.get_last_lr()[0],
+            "warp_intensity": warp_intensity,
         }
 
     def save_checkpoint(self, step: int):
@@ -557,6 +666,12 @@ def main():
         "--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"]
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--latent_clip_path",
+        type=str,
+        default=None,
+        help="Path to trained Latent-CLIP projector weights (e.g., outputs/latent_clip/latent_clip_5000.pt)",
+    )
     args = parser.parse_args()
 
     config = TrainingConfig(
@@ -568,6 +683,7 @@ def main():
         num_workers=args.num_workers,
         mixed_precision=args.mixed_precision,
         seed=args.seed,
+        latent_clip_path=args.latent_clip_path,
     )
 
     trainer = WarpedLoRATrainer(config)
